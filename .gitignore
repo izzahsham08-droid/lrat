@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts (frontend dist is temporary; we copy it to backend/static instead)
+frontend/dist/
+
+# Environment
+.env
+venv/
+.venv/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+Thumbs.db
+
+# IMPORTANT: backend/static IS committed (it holds the built frontend for deployment)
+# Do not ignore it.
