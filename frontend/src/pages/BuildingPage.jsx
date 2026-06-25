@@ -52,7 +52,15 @@ export default function BuildingPage() {
 
   const set = (key) => (val) => setForm(f => ({ ...f, [key]: val }))
 
+  // Required fields that drive the calculation. Without these, results are zero.
+  const canSave =
+    form.L && form.W && form.H && form.location_type &&
+    (form.density_method === 'NSG' ? form.NSG
+      : form.density_method === 'NG' ? (form.NG && form.k)
+      : form.NT)
+
   const goToLines = () => {
+    if (!canSave) return
     const payload = { ...form }
     if (form.density_method === 'NSG') { payload.NG = null; payload.NT = null }
     else if (form.density_method === 'NG') { payload.NSG = null; payload.NT = null }
@@ -173,13 +181,16 @@ export default function BuildingPage() {
         </div>
         <div className="space-y-3">
           <CheckboxInput checked={form.reinforcement_interconnected} onChange={set('reinforcement_interconnected')}
-            label="Reinforcement bars are sufficiently interconnected and earthed" />
+            label="Reinforcement bars are sufficiently interconnected and earthed"
+            hint="Tick only for reinforced concrete with interconnected rods verified per IEC 62305-3 (lowers PS to 0.5)." />
           <CheckboxInput checked={form.unbonded_metal_parts} onChange={set('unbonded_metal_parts')}
-            label="Significant unbonded metal protruding parts present" />
+            label="Significant unbonded metal protruding parts present"
+            hint="Tick if there are significant metal parts not bonded to the structure (forces PS = 1)." />
         </div>
       </SectionCard>
 
       <SectionCard icon={<Network size={15} />} title="Natural LPS Conditions">
+        <p className="text-xs text-slate-400 mb-3">Optional — tick only what applies. Leave all unticked if the structure has no natural LPS features.</p>
         <div className="space-y-3">
           <CheckboxInput checked={form.extensive_metal_framework} onChange={set('extensive_metal_framework')}
             label="Extensive metal framework" />
@@ -192,6 +203,7 @@ export default function BuildingPage() {
       </SectionCard>
 
       <SectionCard icon={<Cable size={15} />} title="Earthing & Bonding">
+        <p className="text-xs text-slate-400 mb-3">Optional — tick only what is installed. Leave unticked if not present.</p>
         <div className="space-y-3">
           <CheckboxInput checked={form.mesh_earth_termination} onChange={set('mesh_earth_termination')}
             label="Meshed earth termination system" />
@@ -203,6 +215,7 @@ export default function BuildingPage() {
       </SectionCard>
 
       <SectionCard icon={<Radio size={15} />} title="Shielding">
+        <p className="text-xs text-slate-400 mb-3">Optional — leave unticked if the structure has no electromagnetic shielding.</p>
         <CheckboxInput checked={form.structure_shielding} onChange={set('structure_shielding')}
           label="Structure electromagnetic shielding present" />
         {form.structure_shielding && (
@@ -216,9 +229,14 @@ export default function BuildingPage() {
         )}
       </SectionCard>
 
-      <div className="flex items-center justify-between mt-8 pt-6 border-t border-slate-100">
+      {!canSave && (
+        <p className="text-xs text-danger-500 text-right mt-4">
+          Please fill in Length, Width, Height, Relative Location, and the lightning density value before continuing.
+        </p>
+      )}
+      <div className="flex items-center justify-between mt-3 pt-6 border-t border-slate-100">
         <button onClick={() => navigate('/')} className="btn-secondary">← Home</button>
-        <button onClick={goToLines} className="btn-primary">
+        <button onClick={goToLines} disabled={!canSave} className="btn-primary">
           {saved ? 'Update & Continue' : 'Save & Continue'} →
         </button>
       </div>
