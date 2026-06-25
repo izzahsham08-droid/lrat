@@ -31,7 +31,7 @@ export default function Home() {
           </div>
           <p className="text-white/90 text-base max-w-lg leading-relaxed mb-7">
             A structured, IEC-based tool for assessing lightning risk, frequency of damage,
-            and environmental consequences for buildings. Based on <strong>MS IEC 62305-2:2024</strong>.
+            and environmental consequences for buildings. Based on <strong> IEC 62305-2:2024</strong>.
           </p>
           <button
             onClick={() => navigate('/building')}
@@ -74,7 +74,7 @@ export default function Home() {
       <div className="card flex items-start gap-4">
         <BookOpen size={20} className="text-brand-300 shrink-0 mt-0.5" />
         <div>
-          <p className="font-semibold text-slate-700 text-sm mb-1">Based on MS IEC 62305-2:2024</p>
+          <p className="font-semibold text-slate-700 text-sm mb-1">Based on IEC 62305-2:2024</p>
           <p className="text-xs text-slate-500 leading-relaxed">
             This tool automates Annex A (N), Annex B (P), Annex C/D (L), and Annex E calculations.
             It calculates risk components R = N × P × L, compares against tolerable limits,
