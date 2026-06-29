@@ -70,17 +70,36 @@ PEB_LEVELS = [
 # Helper: simulate R_total for a modified zone
 # ---------------------------------------------------------------------------
 
+# Fields that belong to the LINE object, not the zone.
+LINE_LEVEL_FIELDS = {"equipotential_bonding_level"}
+
+
+def _apply_overrides(sim_building, zone_name, overrides):
+    """Apply overrides to the correct object: line-level fields go to all
+    lines, zone-level fields go to the named zone."""
+    line_overrides = {k: v for k, v in overrides.items() if k in LINE_LEVEL_FIELDS}
+    zone_overrides = {k: v for k, v in overrides.items() if k not in LINE_LEVEL_FIELDS}
+
+    if line_overrides:
+        for line in sim_building.lines:
+            for field, value in line_overrides.items():
+                setattr(line, field, value)
+
+    if zone_overrides:
+        for z in sim_building.zones:
+            if z.name == zone_name:
+                for field, value in zone_overrides.items():
+                    setattr(z, field, value)
+                break
+
+
 def _simulate_r_total(building, zone_name, zone_overrides):
     """
-    Run the full risk engine with a modified zone.
+    Run the full risk engine with a modified zone or line.
     Returns R_total for that zone, or None if zone not found.
     """
     sim_building = copy.deepcopy(building)
-    for z in sim_building.zones:
-        if z.name == zone_name:
-            for field, value in zone_overrides.items():
-                setattr(z, field, value)
-            break
+    _apply_overrides(sim_building, zone_name, zone_overrides)
     results = RiskEngine.calculate_R(sim_building)
     zone_result = results.get(zone_name)
     if zone_result is None:
@@ -91,11 +110,7 @@ def _simulate_r_total(building, zone_name, zone_overrides):
 def _simulate_f_total(building, zone_name, zone_overrides):
     """Same but for frequency."""
     sim_building = copy.deepcopy(building)
-    for z in sim_building.zones:
-        if z.name == zone_name:
-            for field, value in zone_overrides.items():
-                setattr(z, field, value)
-            break
+    _apply_overrides(sim_building, zone_name, zone_overrides)
     results = FrequencyEngine.calculate_F(sim_building)
     zone_result = results.get(zone_name)
     if zone_result is None:
@@ -177,9 +192,13 @@ def _find_min_rp(building, zone, zone_name, rt):
 
 
 def _find_min_peb(building, zone, zone_name, rt):
-    """Try upgrading PEB level."""
-    current = getattr(zone, "equipotential_bonding_level", "none") or "none"
-    current_idx = next((i for i, (k, l) in enumerate(PEB_LEVELS) if k == current), 0)
+    """Try upgrading PEB level. PEB is a line-level parameter, so the current
+    level is taken from the connected lines (the lowest existing level)."""
+    line_levels = [getattr(l, "equipotential_bonding_level", "none") or "none"
+                   for l in getattr(building, "lines", [])]
+    # Use the weakest existing level as the starting point
+    idx_of = lambda v: next((i for i, (k, l) in enumerate(PEB_LEVELS) if k == v), 0)
+    current_idx = min((idx_of(v) for v in line_levels), default=0)
 
     for i, (key, label) in enumerate(PEB_LEVELS):
         if i <= current_idx:
@@ -201,15 +220,20 @@ def _detect_driver(component, zone):
     if component == "RAD":
         return "PLPS" if not getattr(zone, "lps_protected", False) else "Pam"
     if component == "RB":
-        return "PLPS" if not getattr(zone, "lps_protected", False) else "rP"
+        # Lightning protection only: recommend the LPS. Fire protection (rP)
+        # is a consequence-mitigation measure and is intentionally not
+        # recommended by this lightning protection tool.
+        return "PLPS"
     if component in ["RC", "RM", "RW", "RZ"]:
         return "PSPD"
     if component == "RU":
         touch = getattr(zone, "touch_protection", []) or []
         return "Pam" if not touch or touch == ["none"] else "PEB"
     if component == "RV":
-        fire = getattr(zone, "fire_protection", []) or []
-        return "rP" if not fire or fire == ["none"] else "PEB"
+        # Lightning protection only: recommend equipotential bonding (PEB).
+        # Fire protection (rP) is intentionally not recommended.
+        return "PEB"
+    return None
     return None
 
 
@@ -235,25 +259,37 @@ def _build_actions(driver, building, zone, zone_name, rt, building_inputs):
             # Find minimum sufficient level
             min_key, min_label, min_r = _find_min_spd(building, zone, zone_name, rt, field)
 
-            # Add next level up (even if not sufficient)
-            for i, (key, val, label) in enumerate(SPD_LEVELS):
-                if i <= current_idx:
-                    continue
-                sim_r = _simulate_r_total(building, zone_name, {field: key})
-                is_sufficient = (sim_r is not None and sim_r <= rt)
-                is_minimum = (key == min_key)
+            if min_key is not None:
+                # Recommend the minimum level that actually brings risk within
+                # the tolerable limit — no need to make the user step through
+                # levels that are insufficient.
                 actions.append({
                     "type": "apply_protection",
-                    "display": f"Upgrade {system_label} SPD → {label}",
+                    "display": f"Upgrade {system_label} SPD → {min_label}",
                     "field": field,
-                    "value": key,
+                    "value": min_key,
+                    "system": system_label.lower(),
+                    "estimated_r": min_r,
+                    "is_sufficient": True,
+                    "is_minimum_needed": True,
+                    "note": f"Estimated risk after: {min_r:.3e}",
+                })
+            else:
+                # No single SPD level is sufficient on its own — show the
+                # strongest available level so the user sees the best option.
+                last_key, last_val, last_label = SPD_LEVELS[-1]
+                sim_r = _simulate_r_total(building, zone_name, {field: last_key})
+                actions.append({
+                    "type": "apply_protection",
+                    "display": f"Upgrade {system_label} SPD → {last_label}",
+                    "field": field,
+                    "value": last_key,
                     "system": system_label.lower(),
                     "estimated_r": sim_r,
-                    "is_sufficient": is_sufficient,
-                    "is_minimum_needed": is_minimum,
-                    "note": f"Estimated risk after: {sim_r:.3e}" if sim_r else "Insufficient alone",
+                    "is_sufficient": (sim_r is not None and sim_r <= rt),
+                    "is_minimum_needed": False,
+                    "note": "Strongest level; may need combining with other measures",
                 })
-                break  # only suggest next level up; user can re-run for further steps
 
     elif driver == "Pam":
         current = list(getattr(zone, "touch_protection", []) or [])
@@ -324,8 +360,10 @@ def _build_actions(driver, building, zone, zone_name, rt, building_inputs):
             break
 
     elif driver == "PEB":
-        current = getattr(zone, "equipotential_bonding_level", "none") or "none"
-        current_idx = next((i for i, (k, l) in enumerate(PEB_LEVELS) if k == current), 0)
+        line_levels = [getattr(l, "equipotential_bonding_level", "none") or "none"
+                       for l in getattr(building_inputs, "lines", [])]
+        idx_of = lambda v: next((i for i, (k, l) in enumerate(PEB_LEVELS) if k == v), 0)
+        current_idx = min((idx_of(v) for v in line_levels), default=0)
         for i, (key, label) in enumerate(PEB_LEVELS):
             if i <= current_idx:
                 continue
@@ -345,11 +383,6 @@ def _build_actions(driver, building, zone, zone_name, rt, building_inputs):
             break
 
     return actions
-
-
-# ---------------------------------------------------------------------------
-# Severity helper
-# ---------------------------------------------------------------------------
 
 def _severity(percent):
     if percent >= 30:   return "Critical"
@@ -491,48 +524,72 @@ class ProtectionRecommendationEngine:
         f_total = values.get("F_total", 0) or 0
         zone_output = []
 
-        for item in contributors:
-            # Frequency is always driven by PSPD
-            actions = []
-            for field, system_label in [
-                ("power_spd_level", "Power"),
-                ("telecom_spd_level", "Telecom"),
-            ]:
-                current = getattr(zone, field, "none") or "none"
-                current_idx = next((i for i, (k,v,l) in enumerate(SPD_LEVELS) if k == current), 0)
-                for i, (key, val, label) in enumerate(SPD_LEVELS):
-                    if i <= current_idx:
-                        continue
-                    sim_f = _simulate_f_total(building, zone_name, {field: key})
-                    is_sufficient = (sim_f is not None and sim_f <= ft)
-                    actions.append({
+        if not contributors or f_total <= ft:
+            return zone_output
+
+        # All frequency components are driven by the same SPD protection, so a
+        # single consolidated recommendation is produced rather than repeating
+        # the same SPD action for every component (FC, FM, FW, FZ).
+        # The dominant contributor is reported for context.
+        top = contributors[0]
+        dominant_list = ", ".join(c["component"] for c in contributors)
+
+        actions = []
+        for field, system_label in [
+            ("power_spd_level", "Power"),
+            ("telecom_spd_level", "Telecom"),
+        ]:
+            # Find the minimum SPD level that brings F_total within the limit
+            current = getattr(zone, field, "none") or "none"
+            current_idx = next((i for i, (k,v,l) in enumerate(SPD_LEVELS) if k == current), 0)
+            min_action = None
+            for i, (key, val, label) in enumerate(SPD_LEVELS):
+                if i <= current_idx:
+                    continue
+                sim_f = _simulate_f_total(building, zone_name, {field: key})
+                if sim_f is not None and sim_f <= ft:
+                    min_action = {
                         "type": "apply_protection",
                         "display": f"Upgrade {system_label} SPD → {label}",
                         "field": field,
                         "value": key,
                         "system": system_label.lower(),
                         "estimated_r": sim_f,
-                        "is_sufficient": is_sufficient,
-                        "is_minimum_needed": is_sufficient,
-                        "note": f"Estimated frequency after: {sim_f:.3e}" if sim_f else "Insufficient alone",
-                    })
+                        "is_sufficient": True,
+                        "is_minimum_needed": True,
+                        "note": f"Estimated frequency after: {sim_f:.3e}",
+                    }
                     break
+            if min_action:
+                actions.append(min_action)
+            else:
+                # No single level sufficient — show strongest available
+                last_key, last_val, last_label = SPD_LEVELS[-1]
+                sim_f = _simulate_f_total(building, zone_name, {field: last_key})
+                actions.append({
+                    "type": "apply_protection",
+                    "display": f"Upgrade {system_label} SPD → {last_label}",
+                    "field": field,
+                    "value": last_key,
+                    "system": system_label.lower(),
+                    "estimated_r": sim_f,
+                    "is_sufficient": (sim_f is not None and sim_f <= ft),
+                    "is_minimum_needed": False,
+                    "note": "Strongest level available",
+                })
 
-            sufficient_exists = any(a.get("is_sufficient") for a in actions)
-            zone_output.append({
-                "component": item["component"],
-                "value": item["value"],
-                "percent": item["percent"],
-                "severity": item["severity"],
-                "probability_driver": "PSPD",
-                "summary": (
-                    f"{item['component']} contributes {item['percent']:.1f}% of total frequency. "
-                    f"SPD protection is the main lever. "
-                    + ("A single SPD upgrade can bring frequency within limit."
-                       if sufficient_exists else "Multiple upgrades may be needed.")
-                ),
-                "actions": actions,
-            })
+        sufficient_exists = any(a.get("is_sufficient") for a in actions)
+        zone_output.append({
+            "component": top["component"],
+            "value": top["value"],
+            "percent": top["percent"],
+            "severity": top["severity"],
+            "probability_driver": "PSPD",
+            "summary": f"Frequency exceeds the tolerable limit. Main contributors: {dominant_list}. "
+                       f"All are reduced by upgrading surge protection (SPD).",
+            "actions": actions,
+            "sufficient_exists": sufficient_exists,
+        })
         return zone_output
 
     @staticmethod

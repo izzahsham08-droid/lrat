@@ -250,11 +250,18 @@ function LineForm({ initial, onSave, onCancel }) {
         )}
       </SectionCard>
 
-      <div className="flex gap-3">
-        <button onClick={onCancel} className="btn-secondary">Cancel</button>
-        <button onClick={() => onSave(form)} disabled={!canSave} className="btn-primary">
-          Save Line
-        </button>
+      <div>
+        {!canSave && (
+          <p className="text-xs text-danger-500 mb-3">
+            Please complete the required fields: Name, Service type, Cable type, Uw, and {form.has_line_sections ? 'at least one section' : 'Installation, Line type, Environmental factor and Line length'}.
+          </p>
+        )}
+        <div className="flex gap-3">
+          <button onClick={onCancel} className="btn-secondary">Cancel</button>
+          <button onClick={() => onSave(form)} disabled={!canSave} className="btn-primary">
+            Save Line
+          </button>
+        </div>
       </div>
     </div>
   )

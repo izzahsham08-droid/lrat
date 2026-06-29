@@ -89,6 +89,52 @@ export function AssessmentProvider({ children }) {
     })
   }
 
+  // Apply a protection measure to a specific zone and re-run
+  const applyProtection = async (zoneName, field, value) => {
+    // Some recommendation fields belong to the LINE object, not the zone.
+    const LINE_LEVEL_FIELDS = ['equipotential_bonding_level']
+
+    let updatedZones = zonesData
+    let updatedLines = linesData
+
+    if (LINE_LEVEL_FIELDS.includes(field)) {
+      // Apply to all lines
+      updatedLines = linesData.map(l => ({ ...l, [field]: value }))
+      setLinesData(updatedLines)
+    } else {
+      // Apply to the named zone
+      const zoneIndex = zonesData.findIndex(z => z.name === zoneName)
+      if (zoneIndex === -1) return
+      const updatedZone = { ...zonesData[zoneIndex], [field]: value }
+      updatedZones = zonesData.map((z, i) => i === zoneIndex ? updatedZone : z)
+      setZonesData(updatedZones)
+    }
+
+    // Re-run with updated data
+    setIsCalculating(true)
+    setCalcError(null)
+    try {
+      const res = await fetch('/api/calculate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          building_data: buildingData,
+          lines_data: updatedLines,
+          zones_data: updatedZones,
+        })
+      })
+      if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Calculation failed') }
+      const data = await res.json()
+      setResults(data)
+      return data
+    } catch (e) {
+      setCalcError(e.message)
+      throw e
+    } finally {
+      setIsCalculating(false)
+    }
+  }
+
   const runCalculation = async () => {
     setIsCalculating(true)
     setCalcError(null)
@@ -133,6 +179,7 @@ export function AssessmentProvider({ children }) {
       isCalculating, calcError,
       runCalculation, readiness,
       clearAll, exportProject, importProject,
+      applyProtection,
     }}>
       {children}
     </AssessmentContext.Provider>

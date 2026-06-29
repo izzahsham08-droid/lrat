@@ -86,31 +86,43 @@ function ContributionBar({ contributors }) {
 function ActionButton({ action, zoneName, onApply, isApplying }) {
   const fmt = (v) => v != null ? v.toExponential(3) : '—'
   return (
-    <button
-      onClick={() => onApply(zoneName, action.field, action.value)}
-      disabled={isApplying}
-      className={`flex flex-col items-start gap-0.5 px-3 py-2.5 rounded-lg text-xs font-semibold transition-all text-left
-        ${action.is_sufficient
-          ? action.is_minimum_needed
-            ? 'bg-teal-500 hover:bg-teal-600 text-white shadow-sm'
-            : 'bg-teal-100 hover:bg-teal-200 text-teal-800'
-          : 'bg-white border border-slate-200 hover:border-brand-300 hover:bg-brand-50 text-slate-700'
-        } disabled:opacity-50`}
-    >
-      <div className="flex items-center gap-1.5">
-        {isApplying ? <Loader2 size={12} className="animate-spin" /> : <Shield size={12} />}
-        {action.display}
-        {action.is_minimum_needed && action.is_sufficient && (
-          <span className="bg-white/20 text-[10px] px-1.5 py-0.5 rounded-full">✓ sufficient</span>
+    <div className="flex flex-col gap-1">
+      <button
+        onClick={() => onApply(zoneName, action.field, action.value)}
+        disabled={isApplying}
+        className={`flex flex-col items-start gap-0.5 px-3 py-2.5 rounded-lg text-xs font-semibold transition-all text-left
+          ${action.is_sufficient
+            ? action.is_minimum_needed
+              ? 'bg-teal-500 hover:bg-teal-600 text-white shadow-sm'
+              : 'bg-teal-100 hover:bg-teal-200 text-teal-800'
+            : 'bg-white border border-slate-200 hover:border-brand-300 hover:bg-brand-50 text-slate-700'
+          } disabled:opacity-50`}
+      >
+        <div className="flex items-center gap-1.5">
+          {isApplying ? <Loader2 size={12} className="animate-spin" /> : <Shield size={12} />}
+          {action.display}
+          {action.is_minimum_needed && action.is_sufficient && (
+            <span className="bg-white/20 text-[10px] px-1.5 py-0.5 rounded-full">✓ sufficient</span>
+          )}
+        </div>
+        {action.estimated_r != null && (
+          <span className={`text-[10px] font-normal ${action.is_sufficient ? 'text-white/80' : 'text-slate-400'}`}>
+            Est. after: {fmt(action.estimated_r)}
+            {action.is_sufficient ? ' ✓' : ' (still exceeds limit)'}
+          </span>
         )}
-      </div>
-      {action.estimated_r != null && (
-        <span className={`text-[10px] font-normal ${action.is_sufficient ? 'text-white/80' : 'text-slate-400'}`}>
-          Est. risk after: {fmt(action.estimated_r)}
-          {action.is_sufficient ? ' ✓' : ' (still exceeds limit)'}
-        </span>
+      </button>
+      {action.governing_note && (
+        <p className={`text-[10px] px-2 py-1 rounded-lg flex items-start gap-1 ${
+          action.spd_governed_by === 'frequency'
+            ? 'bg-amber-50 text-amber-700'
+            : 'bg-brand-50 text-brand-600'
+        }`}>
+          <span className="mt-0.5">ⓘ</span>
+          {action.governing_note}
+        </p>
       )}
-    </button>
+    </div>
   )
 }
 
@@ -156,7 +168,11 @@ function RecommendationCard({ rec, zoneName, onApply, isApplying }) {
                   />
                 ))}
               </div>
-
+              {rec.actions.some(a => a.note) && (
+                <p className="text-[11px] text-slate-400 mt-2 italic">
+                  ⓘ {rec.actions.find(a => a.note)?.note}
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -360,10 +376,27 @@ export default function ResultsPage() {
     try { await runCalculation() } catch (e) {}
   }
 
+  const [applyMessage, setApplyMessage] = useState(null)
+
   const handleApply = async (zoneName, field, value) => {
     setApplyingZone(zoneName)
-    try { await applyProtection(zoneName, field, value) } catch (e) {}
-    finally { setApplyingZone(null) }
+    setApplyMessage(null)
+    try {
+      const data = await applyProtection(zoneName, field, value)
+      // Check the new status for this zone and show feedback
+      const newStatus = data?.risk_results?.[zoneName]?.risk_status
+      if (newStatus && newStatus !== 'Protection required') {
+        setApplyMessage({ type: 'success', text: `Protection applied to ${zoneName}. Risk is now within the tolerable limit.` })
+      } else {
+        setApplyMessage({ type: 'info', text: `Protection applied to ${zoneName}. Risk reduced, but further measures may be needed.` })
+      }
+      // Scroll the results into view so the change is visible
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    } catch (e) {
+      setApplyMessage({ type: 'error', text: 'Could not apply protection. Please try again.' })
+    } finally {
+      setApplyingZone(null)
+    }
   }
 
   const handlePDF = async () => {
@@ -448,6 +481,17 @@ export default function ResultsPage() {
       </div>
 
       {calcError && <InfoBox type="error">⚠ {calcError}</InfoBox>}
+
+      {applyMessage && (
+        <div className={`mb-4 px-4 py-3 rounded-xl text-sm font-medium flex items-center gap-2 ${
+          applyMessage.type === 'success' ? 'bg-teal-50 text-teal-700 border border-teal-200'
+          : applyMessage.type === 'error' ? 'bg-danger-50 text-danger-600 border border-danger-100'
+          : 'bg-brand-50 text-brand-700 border border-brand-100'
+        }`}>
+          {applyMessage.type === 'success' ? <CheckCircle2 size={16}/> : applyMessage.type === 'error' ? <XCircle size={16}/> : <Shield size={16}/>}
+          {applyMessage.text}
+        </div>
+      )}
 
       {results && (
         <>

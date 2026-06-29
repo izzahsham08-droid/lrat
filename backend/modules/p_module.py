@@ -182,10 +182,14 @@ class PModule:
         if source not in table:
             raise ValueError("Invalid source of damage for PSPD")
 
+        # "better than LPL I" levels are only tabulated for some sources
+        # (S3 and S4 per Annex B Table B.7/B.8). For sources that do not have
+        # these entries (S1, S2 inductive coupling), fall back to the strongest
+        # defined level ("I"), since a better-than-LPL-I SPD is at least as good.
         if (
-            source in ["S1", "S3"]
-            and isinstance(spd_level, str)
+            isinstance(spd_level, str)
             and spd_level.startswith("better")
+            and spd_level not in table[source]
         ):
             return table[source]["I"]
 

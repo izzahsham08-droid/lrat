@@ -72,7 +72,28 @@ function ZoneForm({ initial, onSave, onCancel }) {
 
   const lossOpts = form.loss_category ? LOSS_MAP[form.loss_category] : null
 
-  const canSave = form.name && form.loss_category
+  const canSave =
+    form.name &&
+    form.loss_category &&
+    form.tz != null && form.tz !== '' &&
+    form.te != null && form.te !== '' &&
+    form.floor_type &&
+    form.fire_risk &&
+    // If a power internal system is present, its wiring must be specified
+    (!form.has_power_internal_system || form.power_internal_wiring) &&
+    // If a telecom internal system is present, its wiring must be specified
+    (!form.has_telecom_internal_system || form.telecom_internal_wiring)
+
+  // Build a list of what's still missing, to show the user
+  const missingFields = []
+  if (!form.name) missingFields.push('Zone name')
+  if (form.tz == null || form.tz === '') missingFields.push('Presence time (tz)')
+  if (form.te == null || form.te === '') missingFields.push('Equipment exposure time (te)')
+  if (!form.floor_type) missingFields.push('Floor type')
+  if (!form.fire_risk) missingFields.push('Fire risk')
+  if (!form.loss_category) missingFields.push('Loss category')
+  if (form.has_power_internal_system && !form.power_internal_wiring) missingFields.push('Power internal wiring')
+  if (form.has_telecom_internal_system && !form.telecom_internal_wiring) missingFields.push('Telecom internal wiring')
 
   return (
     <div className="space-y-5">
@@ -355,11 +376,18 @@ function ZoneForm({ initial, onSave, onCancel }) {
         )}
       </SectionCard>
 
-      <div className="flex gap-3">
-        <button onClick={onCancel} className="btn-secondary">Cancel</button>
-        <button onClick={() => onSave(form)} disabled={!canSave} className="btn-primary">
-          Save Zone
-        </button>
+      <div>
+        {!canSave && missingFields.length > 0 && (
+          <p className="text-xs text-danger-500 mb-3">
+            Please complete: {missingFields.join(', ')}.
+          </p>
+        )}
+        <div className="flex gap-3">
+          <button onClick={onCancel} className="btn-secondary">Cancel</button>
+          <button onClick={() => onSave(form)} disabled={!canSave} className="btn-primary">
+            Save Zone
+          </button>
+        </div>
       </div>
     </div>
   )

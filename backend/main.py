@@ -62,6 +62,58 @@ def calculate(req: AssessmentRequest):
         frequency_recommendations = ProtectionRecommendationEngine.generate_frequency(building, frequency_results)
         annex_e_results = AnnexERiskEngine.calculate_RE(building)
 
+        # ---- SPD consolidation across risk and frequency ----
+        # If frequency needs a higher SPD than risk (or vice versa), the
+        # stronger requirement governs both assessments. Flag this so the
+        # user knows one SPD level satisfies both.
+        SPD_ORDER = ["none", "III_IV", "II", "I", "better_2_5", "better_3_75", "better_5"]
+
+        def spd_idx(key):
+            try: return SPD_ORDER.index(key)
+            except ValueError: return 0
+
+        def get_rec_spd(recs_for_zone, field):
+            """Find the SPD key recommended for a given field in a zone's recs."""
+            for rec in (recs_for_zone or []):
+                for action in rec.get("actions", []):
+                    if action.get("field") == field:
+                        return action.get("value")
+            return None
+
+        for zone_name in set(list(protection_recommendations.keys()) + list(frequency_recommendations.keys())):
+            for field in ["power_spd_level", "telecom_spd_level"]:
+                risk_key = get_rec_spd(protection_recommendations.get(zone_name, []), field)
+                freq_key = get_rec_spd(frequency_recommendations.get(zone_name, []), field)
+
+                if not risk_key and not freq_key:
+                    continue
+
+                risk_idx = spd_idx(risk_key) if risk_key else 0
+                freq_idx = spd_idx(freq_key) if freq_key else 0
+
+                if freq_idx > risk_idx:
+                    # Frequency needs higher SPD — flag risk recommendations
+                    for rec in protection_recommendations.get(zone_name, []):
+                        for action in rec.get("actions", []):
+                            if action.get("field") == field:
+                                action["spd_governed_by"] = "frequency"
+                                action["governing_note"] = (
+                                    f"Frequency assessment requires a higher SPD level "
+                                    f"({SPD_ORDER[freq_idx].replace('_', ' ')}). "
+                                    f"Apply the frequency recommendation to satisfy both."
+                                )
+                elif risk_idx > freq_idx:
+                    # Risk needs higher SPD — flag frequency recommendations
+                    for rec in frequency_recommendations.get(zone_name, []):
+                        for action in rec.get("actions", []):
+                            if action.get("field") == field:
+                                action["spd_governed_by"] = "risk"
+                                action["governing_note"] = (
+                                    f"Risk assessment requires a higher SPD level "
+                                    f"({SPD_ORDER[risk_idx].replace('_', ' ')}). "
+                                    f"Applying the risk recommendation also satisfies frequency."
+                                )
+
         return {
             "risk_results": risk_results,
             "protection_recommendations": protection_recommendations,
