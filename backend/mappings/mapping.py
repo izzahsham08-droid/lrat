@@ -78,7 +78,7 @@ class Mapping:
         "IV": 0.2,
         "III": 0.1,
         "II": 0.05,
-        " I": 0.02,
+        "I": 0.02,
 
         "I_natural": 0.01,
 
