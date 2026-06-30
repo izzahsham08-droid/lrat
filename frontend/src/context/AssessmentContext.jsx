@@ -14,6 +14,11 @@ function loadInitial() {
   }
 }
 
+function clone(value) {
+  if (value === null || value === undefined) return value
+  return JSON.parse(JSON.stringify(value))
+}
+
 export function AssessmentProvider({ children }) {
   const saved = loadInitial()
 
@@ -21,18 +26,27 @@ export function AssessmentProvider({ children }) {
   const [linesData, setLinesData]       = useState(saved?.linesData ?? [])
   const [zonesData, setZonesData]       = useState(saved?.zonesData ?? [])
   const [results, setResults]           = useState(saved?.results ?? null)
+  const [baselineAssessment, setBaselineAssessment] = useState(saved?.baselineAssessment ?? null)
+  const [appliedProtectionHistory, setAppliedProtectionHistory] = useState(saved?.appliedProtectionHistory ?? [])
   const [isCalculating, setIsCalculating] = useState(false)
   const [calcError, setCalcError]       = useState(null)
 
   // Auto-save to browser storage whenever data changes
   useEffect(() => {
-    const payload = { buildingData, linesData, zonesData, results }
+    const payload = {
+      buildingData,
+      linesData,
+      zonesData,
+      results,
+      baselineAssessment,
+      appliedProtectionHistory,
+    }
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
     } catch {
       // storage full or unavailable — ignore silently
     }
-  }, [buildingData, linesData, zonesData, results])
+  }, [buildingData, linesData, zonesData, results, baselineAssessment, appliedProtectionHistory])
 
   const addZone = (zone) => setZonesData(prev => [...prev, zone])
   const updateZone = (index, zone) => setZonesData(prev => prev.map((z, i) => i === index ? zone : z))
@@ -48,6 +62,8 @@ export function AssessmentProvider({ children }) {
     setLinesData([])
     setZonesData([])
     setResults(null)
+    setBaselineAssessment(null)
+    setAppliedProtectionHistory([])
     setCalcError(null)
     try { localStorage.removeItem(STORAGE_KEY) } catch {}
   }
@@ -78,6 +94,8 @@ export function AssessmentProvider({ children }) {
           setLinesData(data.linesData ?? [])
           setZonesData(data.zonesData ?? [])
           setResults(null)        // results must be recalculated for the loaded data
+          setBaselineAssessment(null)
+          setAppliedProtectionHistory([])
           setCalcError(null)
           resolve(true)
         } catch (err) {
@@ -89,26 +107,96 @@ export function AssessmentProvider({ children }) {
     })
   }
 
-  // Apply a protection measure to a specific zone and re-run
-  const applyProtection = async (zoneName, field, value) => {
-    // Some recommendation fields belong to the LINE object, not the zone.
-    const LINE_LEVEL_FIELDS = ['equipotential_bonding_level']
+  const makeAssessmentSnapshot = (building, lines, zones, assessmentResults) => ({
+    capturedAt: new Date().toISOString(),
+    building_data: clone(building),
+    lines_data: clone(lines ?? []),
+    zones_data: clone(zones ?? []),
+    results: clone(assessmentResults),
+  })
 
+  const getChangedZones = (beforeSnapshot, afterSnapshot) => {
+    const beforeRisk = beforeSnapshot?.results?.risk_results ?? {}
+    const afterRisk = afterSnapshot?.results?.risk_results ?? {}
+    const beforeFreq = beforeSnapshot?.results?.frequency_results ?? {}
+    const afterFreq = afterSnapshot?.results?.frequency_results ?? {}
+    const zoneNames = new Set([
+      ...Object.keys(beforeRisk),
+      ...Object.keys(afterRisk),
+      ...Object.keys(beforeFreq),
+      ...Object.keys(afterFreq),
+    ])
+
+    return [...zoneNames].filter(zoneName => {
+      if (zoneName === 'Building_Total') return false
+      const br = beforeRisk[zoneName] ?? {}
+      const ar = afterRisk[zoneName] ?? {}
+      const bf = beforeFreq[zoneName] ?? {}
+      const af = afterFreq[zoneName] ?? {}
+      return (
+        br.R_total !== ar.R_total ||
+        br.risk_status !== ar.risk_status ||
+        bf.F_total !== af.F_total ||
+        bf.frequency_status !== af.frequency_status
+      )
+    })
+  }
+
+  // Apply a protection measure or full protection plan to a specific zone and re-run.
+  const applyProtection = async (zoneName, actionOrField, maybeValue) => {
+    const BUILDING_LEVEL_FIELDS = ['LPS_class']
+    const LINE_LEVEL_FIELDS = ['equipotential_bonding_level']
+    const PEB_ORDER = ['none', 'III-IV', 'II', 'I']
+
+    const action = (
+      typeof actionOrField === 'object' && actionOrField !== null
+        ? actionOrField
+        : { field: actionOrField, value: maybeValue, overrides: { [actionOrField]: maybeValue } }
+    )
+    const overrides = action.overrides ?? { [action.field]: action.value }
+    const overrideFields = Object.keys(overrides)
+    const scope = overrideFields.some(field => BUILDING_LEVEL_FIELDS.includes(field))
+      ? 'building'
+      : overrideFields.some(field => LINE_LEVEL_FIELDS.includes(field))
+        ? 'line'
+        : 'zone'
+
+    let updatedBuilding = buildingData
     let updatedZones = zonesData
     let updatedLines = linesData
 
-    if (LINE_LEVEL_FIELDS.includes(field)) {
-      // Apply to all lines
-      updatedLines = linesData.map(l => ({ ...l, [field]: value }))
-      setLinesData(updatedLines)
-    } else {
-      // Apply to the named zone
-      const zoneIndex = zonesData.findIndex(z => z.name === zoneName)
-      if (zoneIndex === -1) return
-      const updatedZone = { ...zonesData[zoneIndex], [field]: value }
-      updatedZones = zonesData.map((z, i) => i === zoneIndex ? updatedZone : z)
-      setZonesData(updatedZones)
+    const zoneIndex = zonesData.findIndex(z => z.name === zoneName)
+    if (zoneIndex === -1) return
+    const beforeSnapshot = makeAssessmentSnapshot(buildingData, linesData, zonesData, results)
+
+    const upgradePeb = (current, target) => {
+      const currentIdx = PEB_ORDER.indexOf(current ?? 'none')
+      const targetIdx = PEB_ORDER.indexOf(target ?? 'none')
+      if (targetIdx < 0) return current
+      if (currentIdx < 0) return target
+      return targetIdx > currentIdx ? target : current
     }
+
+    Object.entries(overrides).forEach(([field, value]) => {
+      if (BUILDING_LEVEL_FIELDS.includes(field)) {
+        updatedBuilding = { ...(updatedBuilding ?? {}), [field]: value }
+      } else if (LINE_LEVEL_FIELDS.includes(field)) {
+        updatedLines = updatedLines.map(l => ({
+          ...l,
+          [field]: field === 'equipotential_bonding_level'
+            ? upgradePeb(l[field], value)
+            : value,
+        }))
+      } else {
+        updatedZones = updatedZones.map((z, i) => (
+          i === zoneIndex ? { ...z, [field]: value } : z
+        ))
+      }
+    })
+
+    setBuildingData(updatedBuilding)
+    setZonesData(updatedZones)
+    setLinesData(updatedLines)
 
     // Re-run with updated data
     setIsCalculating(true)
@@ -118,15 +206,30 @@ export function AssessmentProvider({ children }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          building_data: buildingData,
+          building_data: updatedBuilding,
           lines_data: updatedLines,
           zones_data: updatedZones,
         })
       })
       if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Calculation failed') }
       const data = await res.json()
+      const afterSnapshot = makeAssessmentSnapshot(updatedBuilding, updatedLines, updatedZones, data)
+      const affectedZones = getChangedZones(beforeSnapshot, afterSnapshot)
       setResults(data)
-      return data
+      setBaselineAssessment(prev => prev ?? beforeSnapshot)
+      setAppliedProtectionHistory(prev => [
+        ...prev,
+        {
+          appliedAt: new Date().toISOString(),
+          zone_name: zoneName,
+          scope,
+          affected_zones: affectedZones,
+          action: clone(action),
+          before: beforeSnapshot,
+          after: afterSnapshot,
+        },
+      ])
+      return { ...data, applied_summary: { scope, affected_zones: affectedZones } }
     } catch (e) {
       setCalcError(e.message)
       throw e
@@ -153,7 +256,10 @@ export function AssessmentProvider({ children }) {
         throw new Error(err.detail || 'Calculation failed')
       }
       const data = await res.json()
+      const baseline = makeAssessmentSnapshot(buildingData, linesData, zonesData, data)
       setResults(data)
+      setBaselineAssessment(baseline)
+      setAppliedProtectionHistory([])
       return data
     } catch (e) {
       setCalcError(e.message)
@@ -176,6 +282,7 @@ export function AssessmentProvider({ children }) {
       linesData, addLine, updateLine, deleteLine,
       zonesData, addZone, updateZone, deleteZone,
       results, setResults,
+      baselineAssessment, appliedProtectionHistory,
       isCalculating, calcError,
       runCalculation, readiness,
       clearAll, exportProject, importProject,

@@ -85,10 +85,16 @@ function ContributionBar({ contributors }) {
 
 function ActionButton({ action, zoneName, onApply, isApplying }) {
   const fmt = (v) => v != null ? v.toExponential(3) : '—'
+  const overrideFields = Object.keys(action.overrides ?? {})
+  const scopeLabel = overrideFields.includes('LPS_class')
+    ? 'Building-level: recalculates all zones'
+    : overrideFields.includes('equipotential_bonding_level')
+      ? 'Line-level: may affect multiple zones'
+      : 'Zone-level: applies to this zone'
   return (
     <div className="flex flex-col gap-1">
       <button
-        onClick={() => onApply(zoneName, action.field, action.value)}
+        onClick={() => onApply(zoneName, action)}
         disabled={isApplying}
         className={`flex flex-col items-start gap-0.5 px-3 py-2.5 rounded-lg text-xs font-semibold transition-all text-left
           ${action.is_sufficient
@@ -111,6 +117,19 @@ function ActionButton({ action, zoneName, onApply, isApplying }) {
             {action.is_sufficient ? ' ✓' : ' (still exceeds limit)'}
           </span>
         )}
+        {(action.old_r != null || action.new_r != null || action.old_f != null || action.new_f != null) && (
+          <span className={`text-[10px] font-normal ${action.is_sufficient ? 'text-white/80' : 'text-slate-400'}`}>
+            R: {fmt(action.old_r)} -> {fmt(action.new_r)} | F: {fmt(action.old_f)} -> {fmt(action.new_f)}
+          </span>
+        )}
+        {action.plan?.steps?.length > 1 && (
+          <span className={`text-[10px] font-normal ${action.is_sufficient ? 'text-white/80' : 'text-slate-400'}`}>
+            Plan steps: {action.plan.steps.map((step, i) => `${i + 1}. ${step.display}`).join(' | ')}
+          </span>
+        )}
+        <span className={`text-[10px] font-normal ${action.is_sufficient ? 'text-white/80' : 'text-slate-400'}`}>
+          {scopeLabel}
+        </span>
       </button>
       {action.governing_note && (
         <p className={`text-[10px] px-2 py-1 rounded-lg flex items-start gap-1 ${
@@ -368,8 +387,20 @@ function FreqZoneResult({ zoneName, values, recommendations, onApply, isApplying
 }
 
 export default function ResultsPage() {
-  const { buildingData, linesData, zonesData, results, isCalculating, calcError, runCalculation, readiness, applyProtection } = useAssessment()
-  const [pdfLoading, setPdfLoading] = useState(false)
+  const {
+    buildingData,
+    linesData,
+    zonesData,
+    results,
+    baselineAssessment,
+    appliedProtectionHistory,
+    isCalculating,
+    calcError,
+    runCalculation,
+    readiness,
+    applyProtection,
+  } = useAssessment()
+  const [pdfLoading, setPdfLoading] = useState(null)
   const [applyingZone, setApplyingZone] = useState(null)
 
   const handleRun = async () => {
@@ -378,17 +409,22 @@ export default function ResultsPage() {
 
   const [applyMessage, setApplyMessage] = useState(null)
 
-  const handleApply = async (zoneName, field, value) => {
+  const handleApply = async (zoneName, action) => {
     setApplyingZone(zoneName)
     setApplyMessage(null)
     try {
-      const data = await applyProtection(zoneName, field, value)
+      const data = await applyProtection(zoneName, action)
       // Check the new status for this zone and show feedback
       const newStatus = data?.risk_results?.[zoneName]?.risk_status
+      const affectedZones = data?.applied_summary?.affected_zones ?? []
+      const otherAffectedZones = affectedZones.filter(name => name !== zoneName)
+      const affectedText = otherAffectedZones.length
+        ? ` This ${data?.applied_summary?.scope}-level change also affected: ${otherAffectedZones.join(', ')}.`
+        : ''
       if (newStatus && newStatus !== 'Protection required') {
-        setApplyMessage({ type: 'success', text: `Protection applied to ${zoneName}. Risk is now within the tolerable limit.` })
+        setApplyMessage({ type: 'success', text: `Protection applied to ${zoneName}. Risk is now within the tolerable limit.${affectedText}` })
       } else {
-        setApplyMessage({ type: 'info', text: `Protection applied to ${zoneName}. Risk reduced, but further measures may be needed.` })
+        setApplyMessage({ type: 'info', text: `Protection applied to ${zoneName}. Risk reduced, but further measures may be needed.${affectedText}` })
       }
       // Scroll the results into view so the change is visible
       window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -399,30 +435,39 @@ export default function ResultsPage() {
     }
   }
 
-  const handlePDF = async () => {
+  const handlePDF = async (mode = 'current') => {
     if (!results) return
-    setPdfLoading(true)
+    const useBaseline = mode === 'baseline' && baselineAssessment?.results
+    const sourceResults = useBaseline ? baselineAssessment.results : results
+    const payload = {
+      building_data: useBaseline ? baselineAssessment.building_data : buildingData,
+      lines_data: useBaseline ? baselineAssessment.lines_data : linesData,
+      zones_data: useBaseline ? baselineAssessment.zones_data : zonesData,
+      report_mode: useBaseline ? 'baseline' : appliedProtectionHistory?.length ? 'protected' : 'current',
+      baseline_assessment: useBaseline ? null : baselineAssessment,
+      applied_protection_history: useBaseline ? [] : appliedProtectionHistory,
+      ...sourceResults,
+    }
+
+    setPdfLoading(mode)
     try {
       const res = await fetch('/api/generate-pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          building_data: buildingData,
-          lines_data: linesData,
-          zones_data: zonesData,
-          ...results,
-        })
+        body: JSON.stringify(payload)
       })
       if (!res.ok) throw new Error('PDF generation failed')
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
-      a.href = url; a.download = 'lightning_risk_report.pdf'; a.click()
+      a.href = url
+      a.download = useBaseline ? 'lightning_risk_before_protection.pdf' : 'lightning_risk_after_protection.pdf'
+      a.click()
       URL.revokeObjectURL(url)
     } catch (e) {
       alert('PDF error: ' + e.message)
     } finally {
-      setPdfLoading(false)
+      setPdfLoading(null)
     }
   }
 
@@ -472,11 +517,32 @@ export default function ResultsPage() {
           }
         </button>
         {results && (
-          <button onClick={handlePDF} disabled={pdfLoading}
-            className="btn-secondary flex items-center gap-2 px-5">
-            {pdfLoading ? <Loader2 size={16} className="animate-spin"/> : <Download size={16}/>}
-            PDF Report
-          </button>
+          <>
+            <button
+              onClick={() => handlePDF('baseline')}
+              disabled={!!pdfLoading || !baselineAssessment?.results}
+              className="btn-secondary flex items-center gap-2 px-5"
+              title="Generate the unprotected assessment PDF"
+            >
+              {pdfLoading === 'baseline' ? <Loader2 size={16} className="animate-spin"/> : <Download size={16}/>}
+              Before PDF
+            </button>
+            <button
+              onClick={() => handlePDF('current')}
+              disabled={!!pdfLoading || !appliedProtectionHistory?.length}
+              className={`btn-secondary flex items-center gap-2 px-5 ${
+                !appliedProtectionHistory?.length ? 'opacity-50 cursor-not-allowed' : ''
+              }`}
+              title={
+                appliedProtectionHistory?.length
+                  ? 'Generate the protected assessment PDF'
+                  : 'Apply a protection measure first'
+              }
+            >
+              {pdfLoading === 'current' ? <Loader2 size={16} className="animate-spin"/> : <Download size={16}/>}
+              After PDF
+            </button>
+          </>
         )}
       </div>
 

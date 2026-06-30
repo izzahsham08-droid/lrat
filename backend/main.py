@@ -37,6 +37,9 @@ class PDFRequest(BaseModel):
     annex_e_results: dict
     protection_recommendations: dict
     frequency_recommendations: dict
+    baseline_assessment: Optional[dict] = None
+    applied_protection_history: Optional[list] = None
+    report_mode: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +138,10 @@ def generate_pdf(req: PDFRequest):
             tmp.name,
             req.building_data, req.lines_data, req.zones_data,
             req.risk_results, req.frequency_results, req.annex_e_results,
-            req.protection_recommendations, req.frequency_recommendations
+            req.protection_recommendations, req.frequency_recommendations,
+            baseline_assessment=req.baseline_assessment,
+            applied_protection_history=req.applied_protection_history or [],
+            report_mode=req.report_mode or "current"
         )
         return FileResponse(tmp.name, media_type="application/pdf", filename="lightning_risk_report.pdf")
     except Exception as e:
