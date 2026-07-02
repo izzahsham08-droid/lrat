@@ -126,6 +126,18 @@ PROTECTION_FACTORS = {
     },
 }
 
+R_COMPONENT_DRIVER_MAP = {
+    "RAT": ["Pam", "PLPS"],
+    "RAD": ["Pam", "PLPS"],
+    "RB": ["PLPS", "rP"],
+    "RC": ["PSPD"],
+    "RM": ["PSPD"],
+    "RU": ["Pam", "PEB"],
+    "RV": ["PEB", "rP"],
+    "RW": ["PSPD", "PEB"],
+    "RZ": ["PSPD"],
+}
+
 RP_MEASURES = [
     ("automatic_extinguishing", "Install automatic fire extinguishing system", 3),
     ("automatic_alarm", "Install automatic fire alarm", 2),
@@ -414,6 +426,804 @@ def _top_contributors(grouped, total, min_percent=5, top_n=3):
                 "severity": _severity(percent),
             })
     return sorted(items, key=lambda x: x["percent"], reverse=True)[:top_n]
+
+
+def _dominant_zone_components(values, min_percent=10, top_n=3):
+    """Return actual R components that meaningfully contribute to this zone.
+
+    Annex F discusses the dominant calculated components first, then explains
+    which protection factor can reduce them. This helper intentionally avoids
+    treating PSPD, PLPS, Pam, PEB, or rP as risk contributors.
+    """
+    grouped = _grouped_risk(values)
+    total = values.get("R_total", 0) or 0
+    if total <= 0:
+        return []
+
+    items = []
+    for component, value in grouped.items():
+        if value <= 0:
+            continue
+        percent = (value / total) * 100
+        items.append({
+            "component": component,
+            "value": value,
+            "percent": percent,
+            "severity": _severity(percent),
+            "control_factors": R_COMPONENT_DRIVER_MAP.get(component, []),
+        })
+
+    items = sorted(items, key=lambda item: item["percent"], reverse=True)
+    selected = [item for item in items if item["percent"] >= min_percent][:top_n]
+    return selected or items[:1]
+
+
+def _factor_label(factor):
+    return PROTECTION_FACTORS.get(factor, {}).get("label", factor)
+
+
+def _unique_in_order(values):
+    seen = set()
+    output = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+    return output
+
+
+def _recommendation_scope(action):
+    fields = set((action or {}).get("overrides", {}).keys())
+    has_building = bool(fields & BUILDING_LEVEL_FIELDS)
+    has_line = bool(fields & LINE_LEVEL_FIELDS)
+    has_zone = bool(fields - BUILDING_LEVEL_FIELDS - LINE_LEVEL_FIELDS)
+    if sum([has_building, has_line, has_zone]) > 1:
+        return "mixed"
+    if has_building:
+        return "building"
+    if has_line:
+        return "line"
+    return "zone"
+
+
+def _extract_plan_steps(zone_name, recommendations):
+    """Flatten existing simulated actions into readable plan steps.
+
+    The existing planner still performs the real simulation. This function only
+    reframes the output so the UI can present an Annex-F-style plan summary.
+    """
+    steps = []
+    for rec in recommendations or []:
+        for action in rec.get("actions", []) or []:
+            plan_steps = action.get("plan", {}).get("steps")
+            source_steps = plan_steps if plan_steps else [action]
+            for source in source_steps:
+                steps.append({
+                    "zone_name": zone_name,
+                    "display": source.get("display"),
+                    "scope": _recommendation_scope(source),
+                    "overrides": source.get("overrides", {}),
+                    "old_r": source.get("old_r"),
+                    "new_r": source.get("new_r"),
+                    "old_f": source.get("old_f"),
+                    "new_f": source.get("new_f"),
+                    "risk_sufficient": source.get("risk_sufficient"),
+                    "frequency_sufficient": source.get("frequency_sufficient"),
+                    "protection_factor": (
+                        source.get("protection_factor")
+                        or source.get("probability_factor")
+                        or rec.get("protection_factor")
+                    ),
+                    "protection_factor_label": (
+                        source.get("protection_factor_label")
+                        or source.get("probability_factor_label")
+                        or rec.get("protection_factor_label")
+                    ),
+                    "controlled_components": (
+                        source.get("controlled_components")
+                        or rec.get("controlled_components")
+                        or rec.get("dominant_components")
+                        or []
+                    ),
+                    "selected_because": source.get("selected_because") or rec.get("selected_because"),
+                })
+    return steps
+
+
+def _group_plan_steps(steps, failed_zone_names):
+    grouped = {}
+    for step in steps:
+        marker = (
+            step.get("display"),
+            step.get("scope"),
+            tuple(sorted((k, repr(v)) for k, v in (step.get("overrides") or {}).items())),
+        )
+        if marker not in grouped:
+            grouped[marker] = {
+                **step,
+                "target_zones": [],
+                "controlled_components": [],
+            }
+        grouped[marker]["target_zones"] += (
+            step.get("target_zones")
+            or step.get("affected_zones")
+            or [step["zone_name"]]
+        )
+        grouped[marker]["controlled_components"] += step.get("controlled_components") or []
+
+    output = []
+    for item in grouped.values():
+        scope = item["scope"]
+        if scope in {"building", "line"}:
+            item["affected_zones"] = list(failed_zone_names)
+        else:
+            item["affected_zones"] = _unique_in_order(item["target_zones"])
+        item["target_zones"] = _unique_in_order(item["target_zones"])
+        item["controlled_components"] = _unique_in_order(item["controlled_components"])
+        output.append(item)
+
+    return sorted(
+        output,
+        key=lambda item: (
+            {"building": 0, "line": 1, "mixed": 2, "zone": 3}.get(item["scope"], 9),
+            item["display"] or "",
+        ),
+    )
+
+
+def _build_whole_plan_action(recommended_steps, failed_zone_names):
+    if not recommended_steps:
+        return None
+
+    building_overrides = {}
+    line_overrides = {}
+    zone_overrides = {}
+
+    for step in recommended_steps:
+        targets = step.get("target_zones") or step.get("affected_zones") or [step.get("zone_name")]
+        targets = [zone_name for zone_name in targets if zone_name]
+
+        for field, value in (step.get("overrides") or {}).items():
+            if field in BUILDING_LEVEL_FIELDS:
+                building_overrides[field] = value
+            elif field in LINE_LEVEL_FIELDS:
+                line_overrides[field] = value
+            else:
+                for zone_name in targets:
+                    zone_overrides.setdefault(zone_name, {})[field] = value
+
+    return {
+        "type": "apply_protection_plan",
+        "display": "Apply recommended protection plan",
+        "field": "protection_plan",
+        "system": "whole_plan",
+        "scope": "whole_plan",
+        "overrides": {},
+        "building_overrides": building_overrides,
+        "line_overrides": line_overrides,
+        "zone_overrides": zone_overrides,
+        "affected_zones": list(failed_zone_names),
+        "steps": recommended_steps,
+        "selected_because": (
+            "Applies the simulated plan as one package, then reruns the full "
+            "assessment once so building-level and line-level effects are "
+            "reflected across all affected zones."
+        ),
+    }
+
+
+def _apply_whole_plan_action(building, action):
+    for field, value in (action or {}).get("building_overrides", {}).items():
+        if field == "LPS_class":
+            current = getattr(building, field, None)
+            if _level_index(PLPS_LEVELS, value) > _level_index(PLPS_LEVELS, current):
+                setattr(building, field, value)
+        else:
+            setattr(building, field, value)
+
+    for field, value in (action or {}).get("line_overrides", {}).items():
+        if field == "equipotential_bonding_level":
+            _upgrade_lines_to_min_level(building.lines, value)
+        else:
+            for line in building.lines:
+                setattr(line, field, value)
+
+    for zone_name, overrides in (action or {}).get("zone_overrides", {}).items():
+        zone = _zone_by_name(building, zone_name)
+        if zone is None:
+            continue
+        for field, value in (overrides or {}).items():
+            setattr(zone, field, value)
+
+
+def _simulate_whole_plan(building, steps, failed_zone_names):
+    action = _build_whole_plan_action(steps, failed_zone_names)
+    sim_building = copy.deepcopy(building)
+    _apply_whole_plan_action(sim_building, action)
+    risk_results = RiskEngine.calculate_R(sim_building)
+    frequency_results = FrequencyEngine.calculate_F(sim_building)
+    return {
+        "building": sim_building,
+        "risk_results": risk_results,
+        "frequency_results": frequency_results,
+        "action": action,
+    }
+
+
+def _failed_zone_names(risk_results):
+    names = []
+    for zone_name, values in risk_results.items():
+        if zone_name == "Building_Total":
+            continue
+        r_total = values.get("R_total", 0) or 0
+        rt = values.get("RT", 1e-5) or 1e-5
+        if r_total > rt:
+            names.append(zone_name)
+    return names
+
+
+def _failed_frequency_zone_names(frequency_results):
+    names = []
+    for zone_name, values in frequency_results.items():
+        if zone_name == "Building_Total":
+            continue
+        f_total = values.get("F_total", 0) or 0
+        ft = values.get("FT", 5e-2) or 5e-2
+        if f_total > ft:
+            names.append(zone_name)
+    return names
+
+
+def _risk_sum(risk_results, zone_names):
+    return sum((risk_results.get(zone_name, {}).get("R_total", 0) or 0) for zone_name in zone_names)
+
+
+def _frequency_sum(frequency_results, zone_names):
+    return sum((frequency_results.get(zone_name, {}).get("F_total", 0) or 0) for zone_name in zone_names)
+
+
+def _fixed_count(before_risk, after_risk, zone_names):
+    fixed = 0
+    for zone_name in zone_names:
+        before = before_risk.get(zone_name, {})
+        after = after_risk.get(zone_name, {})
+        before_failed = (before.get("R_total", 0) or 0) > (before.get("RT", 1e-5) or 1e-5)
+        after_passed = (after.get("R_total", 0) or 0) <= (after.get("RT", 1e-5) or 1e-5)
+        if before_failed and after_passed:
+            fixed += 1
+    return fixed
+
+
+def _all_pass(after_risk, zone_names):
+    return all(
+        (after_risk.get(zone_name, {}).get("R_total", 0) or 0)
+        <= (after_risk.get(zone_name, {}).get("RT", 1e-5) or 1e-5)
+        for zone_name in zone_names
+    )
+
+
+def _frequency_pass(after_frequency, zone_names):
+    return all(
+        (after_frequency.get(zone_name, {}).get("F_total", 0) or 0)
+        <= (after_frequency.get(zone_name, {}).get("FT", 5e-2) or 5e-2)
+        for zone_name in zone_names
+    )
+
+
+def _step_from_candidate(candidate, target_zones, before_risk, after_risk, failed_zone_names, scope=None):
+    old_r = _risk_sum(before_risk, target_zones)
+    new_r = _risk_sum(after_risk, target_zones)
+    return {
+        "zone_name": target_zones[0] if len(target_zones) == 1 else "multiple zones",
+        "display": candidate["display"],
+        "scope": scope or _recommendation_scope(candidate),
+        "overrides": candidate.get("overrides", {}),
+        "old_r": old_r,
+        "new_r": new_r,
+        "old_f": None,
+        "new_f": None,
+        "risk_sufficient": _all_pass(after_risk, target_zones),
+        "frequency_sufficient": None,
+        "protection_factor": candidate.get("factor"),
+        "protection_factor_label": candidate.get("factor_label"),
+        "controlled_components": candidate.get("components") or candidate.get("controlled_components") or [],
+        "selected_because": candidate.get("reason"),
+        "target_zones": list(target_zones),
+        "affected_zones": list(failed_zone_names) if scope in {"building", "line"} else list(target_zones),
+    }
+
+
+def _global_lps_peb_candidates(building, failed_zones):
+    dominant_components = {
+        component["component"]
+        for zone in failed_zones
+        for component in zone.get("dominant_components", [])
+    }
+    if not (dominant_components & {"RAT", "RAD", "RB", "RU", "RV"}):
+        return []
+
+    current_lps = getattr(building, "LPS_class", None)
+    current_lps_idx = _level_index(PLPS_LEVELS, current_lps)
+    line_levels = [
+        getattr(line, "equipotential_bonding_level", "none") or "none"
+        for line in getattr(building, "lines", [])
+    ]
+    current_peb_idx = min((_level_index(PEB_LEVELS, value) for value in line_levels), default=0)
+    has_lines = bool(getattr(building, "lines", []))
+
+    candidates = []
+
+    # PEB-only candidates: bonding alone reduces RU/RV without the cost of an
+    # LPS, which only helps RAT/RAD/RB. These must be able to compete against
+    # the bundled packages below, otherwise a case where only RU/RV are
+    # dominant always over-recommends an unnecessary LPS.
+    if has_lines and (dominant_components & {"RU", "RV"}):
+        for peb_key, _label, peb_complexity in PEB_LEVELS[1:]:
+            peb_idx = _level_index(PEB_LEVELS, peb_key)
+            if peb_idx <= current_peb_idx:
+                continue
+            candidates.append(_candidate(
+                f"Equipotential bonding SPD Class {peb_key} (no LPS)",
+                {"equipotential_bonding_level": peb_key},
+                "peb_only_package",
+                peb_idx,
+                "Bonding alone addresses RU/RV without the added cost of an LPS.",
+                sorted(dominant_components & {"RU", "RV"}),
+            ))
+
+    # LPS + PEB bundles: needed whenever RAT/RAD/RB are dominant, since an
+    # LPS installation is only coherent with matching mandatory bonding.
+    if dominant_components & {"RAT", "RAD", "RB"}:
+        package_levels = [
+            ("IV", "III-IV"),
+            ("III", "III-IV"),
+            ("II", "II"),
+            ("I", "I"),
+        ]
+        for lps_key, peb_key in package_levels:
+            lps_idx = _level_index(PLPS_LEVELS, lps_key)
+            peb_idx = _level_index(PEB_LEVELS, peb_key)
+            overrides = {}
+            if lps_idx > current_lps_idx:
+                overrides["LPS_class"] = lps_key
+            if peb_idx > current_peb_idx and has_lines:
+                overrides["equipotential_bonding_level"] = peb_key
+            if not overrides:
+                continue
+            candidates.append(_candidate(
+                f"Building package: LPS Class {lps_key} + equipotential bonding SPD Class {peb_key}",
+                overrides,
+                "global_lps_peb_package",
+                lps_idx + peb_idx,
+                "Broad Annex-F-style package simulated before zone-specific measures.",
+                sorted(dominant_components & {"RAT", "RAD", "RB", "RU", "RV"}),
+            ))
+    return candidates
+
+
+def _select_broad_candidate(building, candidates, before_risk, failed_zone_names):
+    simulated = []
+    before_sum = _risk_sum(before_risk, failed_zone_names)
+    for candidate in candidates:
+        step = _step_from_candidate(candidate, failed_zone_names, before_risk, before_risk, failed_zone_names, scope="mixed")
+        sim = _simulate_whole_plan(building, [step], failed_zone_names)
+        after_risk = sim["risk_results"]
+        after_sum = _risk_sum(after_risk, failed_zone_names)
+        reduction = before_sum - after_sum
+        if reduction <= MIN_IMPROVEMENT:
+            evaluated = {
+                "candidate": candidate,
+                "display": candidate["display"],
+                "scope": "mixed",
+                "old_r": before_sum,
+                "new_r": after_sum,
+                "risk_reduction": reduction,
+                "fixed_count": _fixed_count(before_risk, after_risk, failed_zone_names),
+                "all_pass": _all_pass(after_risk, failed_zone_names),
+                "selected": False,
+                "reason": "Evaluated but did not produce a meaningful total risk reduction.",
+            }
+            simulated.append(evaluated)
+            continue
+        simulated.append({
+            "candidate": candidate,
+            "display": candidate["display"],
+            "scope": "mixed",
+            "old_r": before_sum,
+            "new_r": after_sum,
+            "risk_reduction": reduction,
+            "after_risk": after_risk,
+            "fixed_count": _fixed_count(before_risk, after_risk, failed_zone_names),
+            "all_pass": _all_pass(after_risk, failed_zone_names),
+            "after_sum": after_sum,
+            "reduction": reduction,
+            "selected": False,
+            "reason": "Evaluated by applying the package to a copied building and rerunning the full risk engine.",
+        })
+
+    if not simulated:
+        return None
+
+    improving = [item for item in simulated if item.get("risk_reduction", 0) > MIN_IMPROVEMENT]
+    if not improving:
+        return {"selected": None, "trace": simulated}
+
+    sufficient = [item for item in improving if item["all_pass"]]
+    if sufficient:
+        selected = sorted(sufficient, key=lambda item: (item["candidate"]["complexity"], item["after_sum"]))[0]
+        selected["selected"] = True
+        selected["reason"] = "Selected as the minimum broad package that brings all failed zones within RT."
+        return {"selected": selected, "trace": simulated}
+
+    practical = [
+        item for item in improving
+        if item["candidate"].get("overrides", {}).get("LPS_class") == "II"
+        and item["candidate"].get("overrides", {}).get("equipotential_bonding_level") == "II"
+    ]
+    if len(failed_zone_names) > 1 and practical:
+        selected = practical[0]
+        selected["selected"] = True
+        selected["reason"] = (
+            "Selected as the practical broad package for a multi-zone case. "
+            "It is evaluated before stronger or zone-specific measures."
+        )
+        return {"selected": selected, "trace": simulated}
+
+    selected = sorted(
+        improving,
+        key=lambda item: (
+            -item["fixed_count"],
+            item["candidate"]["complexity"],
+            item["after_sum"],
+            -item["reduction"],
+        ),
+    )[0]
+    selected["selected"] = True
+    selected["reason"] = "Selected because no broad package was sufficient; this package produced the best broad improvement."
+    return {"selected": selected, "trace": simulated}
+
+
+def _zone_candidates_for_plan(building, zone, components):
+    names = [component["component"] for component in components]
+    candidates = []
+    if any(name in {"RAT", "RAD", "RU"} for name in names):
+        candidates += _pam_candidates(zone, [name for name in names if name in {"RAT", "RAD", "RU"}])
+    if any(name in {"RC", "RM", "RW", "RZ"} for name in names):
+        candidates += _coordinated_spd_candidates(
+            building,
+            zone,
+            [name for name in names if name in {"RC", "RM", "RW", "RZ"}],
+        )
+    if any(name in {"RB", "RV"} for name in names):
+        candidates += _fire_candidates(zone, [name for name in names if name in {"RB", "RV"}])
+    return _dedupe_candidates(candidates)
+
+
+def _select_zone_candidate(building, zone_name, before_risk, failed_zone_names):
+    zone_values = before_risk.get(zone_name, {})
+    components = _dominant_zone_components(zone_values)
+    zone = _zone_by_name(building, zone_name)
+    if zone is None:
+        return None
+
+    candidates = _zone_candidates_for_plan(building, zone, components)
+    simulated = []
+    before_value = zone_values.get("R_total", 0) or 0
+    for candidate in candidates:
+        step = _step_from_candidate(candidate, [zone_name], before_risk, before_risk, failed_zone_names, scope="zone")
+        sim = _simulate_whole_plan(building, [step], failed_zone_names)
+        after_values = sim["risk_results"].get(zone_name, {})
+        after_value = after_values.get("R_total", 0) or 0
+        reduction = before_value - after_value
+        if reduction <= MIN_IMPROVEMENT:
+            continue
+        simulated.append({
+            "candidate": candidate,
+            "after_risk": sim["risk_results"],
+            "after_value": after_value,
+            "reduction": reduction,
+            "sufficient": after_value <= (after_values.get("RT", 1e-5) or 1e-5),
+        })
+
+    if not simulated:
+        return None
+
+    sufficient = [item for item in simulated if item["sufficient"]]
+    if sufficient:
+        return sorted(
+            sufficient,
+            key=lambda item: (
+                item["candidate"]["complexity"],
+                len(item["candidate"]["overrides"]),
+                item["after_value"],
+            ),
+        )[0]
+
+    return sorted(simulated, key=lambda item: (item["after_value"], item["candidate"]["complexity"]))[0]
+
+
+def _select_frequency_candidate(building, zone_name, before_risk, before_frequency, failed_frequency_names):
+    zone = _zone_by_name(building, zone_name)
+    if zone is None:
+        return None
+
+    values = before_frequency.get(zone_name, {})
+    components = _top_contributors(
+        _grouped_frequency(values),
+        values.get("F_total", 0) or 0,
+        min_percent=5,
+        top_n=4,
+    )
+    component_names = [item["component"] for item in components]
+    candidates = _coordinated_spd_candidates(building, zone, component_names)
+    simulated = []
+    before_value = values.get("F_total", 0) or 0
+
+    for candidate in candidates:
+        step = _step_from_candidate(
+            candidate,
+            [zone_name],
+            before_risk,
+            before_risk,
+            failed_frequency_names,
+            scope="zone",
+        )
+        sim = _simulate_whole_plan(building, [step], failed_frequency_names)
+        after_frequency = sim["frequency_results"]
+        after_values = after_frequency.get(zone_name, {})
+        after_value = after_values.get("F_total", 0) or 0
+        reduction = before_value - after_value
+        if reduction <= MIN_IMPROVEMENT:
+            continue
+        simulated.append({
+            "candidate": candidate,
+            "after_risk": sim["risk_results"],
+            "after_frequency": after_frequency,
+            "after_value": after_value,
+            "reduction": reduction,
+            "sufficient": after_value <= (after_values.get("FT", 5e-2) or 5e-2),
+        })
+
+    if not simulated:
+        return None
+
+    sufficient = [item for item in simulated if item["sufficient"]]
+    if sufficient:
+        return sorted(
+            sufficient,
+            key=lambda item: (
+                item["candidate"]["complexity"],
+                len(item["candidate"]["overrides"]),
+                item["after_value"],
+            ),
+        )[0]
+
+    return sorted(simulated, key=lambda item: (item["after_value"], item["candidate"]["complexity"]))[0]
+
+
+def _phase0_cheap_zone_fixes(working, current_risk, failed_zone_names):
+    """Try cheap, zone-local Pam-only fixes before committing to broad
+    building-wide measures. Mirrors Annex F's own worked example, where a
+    warning notice is applied to a single exposed zone before deciding a
+    building-wide LPS is needed for other, more serious zones. Returns the
+    steps taken, the remaining still-failed zone names, and the updated risk
+    results after applying them."""
+    steps = []
+    trace = []
+    remaining = list(failed_zone_names)
+
+    for zone_name in list(remaining):
+        zone_values = current_risk.get(zone_name, {})
+        dominant = _dominant_zone_components(zone_values)
+        component_names = [c["component"] for c in dominant]
+        pam_components = [name for name in component_names if name in {"RAT", "RAD", "RU"}]
+        if not pam_components:
+            continue
+
+        zone = _zone_by_name(working, zone_name)
+        if zone is None:
+            continue
+
+        before_value = zone_values.get("R_total", 0) or 0
+        rt = zone_values.get("RT", 1e-5) or 1e-5
+        candidates = _pam_candidates(zone, pam_components)
+
+        best = None
+        best_after_risk = None
+        for candidate in candidates:
+            step = _step_from_candidate(candidate, [zone_name], current_risk, current_risk, failed_zone_names, scope="zone")
+            sim = _simulate_whole_plan(working, [step], failed_zone_names)
+            after_value = sim["risk_results"].get(zone_name, {}).get("R_total", 0) or 0
+            if after_value <= rt and (best is None or candidate["complexity"] < best["complexity"]):
+                best = candidate
+                best_after_risk = sim["risk_results"]
+
+        if best is not None:
+            step = _step_from_candidate(best, [zone_name], current_risk, best_after_risk, failed_zone_names, scope="zone")
+            step["selected_because"] = (
+                "Selected as a cheap, zone-local fix (Pam) that alone resolves this "
+                "zone, evaluated before committing to a broad building-wide package."
+            )
+            steps.append(step)
+            after_value = best_after_risk.get(zone_name, {}).get("R_total", 0) or 0
+            trace.append({
+                "display": best["display"],
+                "scope": "zone",
+                "old_r": before_value,
+                "new_r": after_value,
+                "risk_reduction": before_value - after_value,
+                "fixed_count": 1,
+                "all_pass": True,
+                "selected": True,
+                "reason": f"Cheap zone-local Pam fix resolved {zone_name} without needing a broad package.",
+            })
+            _apply_whole_plan_action(working, _build_whole_plan_action([step], failed_zone_names))
+            current_risk = RiskEngine.calculate_R(working)
+            remaining.remove(zone_name)
+
+    return steps, remaining, current_risk, trace
+
+
+def _build_package_level_plan(building, risk_results, failed_zones, frequency_results=None):
+    failed_zone_names = [zone["zone_name"] for zone in failed_zones]
+    if not failed_zone_names and frequency_results:
+        failed_zone_names = _failed_frequency_zone_names(frequency_results)
+    if not failed_zone_names:
+        return {"steps": [], "trace": []}
+
+    working = copy.deepcopy(building)
+    current_risk = risk_results
+    steps = []
+    evaluation_trace = []
+
+    # Phase 0: cheap, zone-local Pam fixes tried first, before any broad
+    # building-wide package is even considered.
+    phase0_steps, failed_zone_names, current_risk, phase0_trace = _phase0_cheap_zone_fixes(
+        working, current_risk, failed_zone_names
+    )
+    steps += phase0_steps
+    evaluation_trace += phase0_trace
+
+    broad_result = _select_broad_candidate(
+        working,
+        _global_lps_peb_candidates(working, [z for z in failed_zones if z["zone_name"] in failed_zone_names]),
+        current_risk,
+        failed_zone_names,
+    )
+    evaluation_trace += (broad_result or {}).get("trace", [])
+    broad = (broad_result or {}).get("selected")
+    if broad:
+        step = _step_from_candidate(
+            broad["candidate"],
+            failed_zone_names,
+            current_risk,
+            broad["after_risk"],
+            failed_zone_names,
+            scope="mixed",
+        )
+        step["selected_because"] = broad.get("reason") or step.get("selected_because")
+        steps.append(step)
+        _apply_whole_plan_action(working, _build_whole_plan_action([step], failed_zone_names))
+        current_risk = broad["after_risk"]
+
+    for _ in range(MAX_PLAN_STEPS):
+        remaining = _failed_zone_names(current_risk)
+        remaining = [zone_name for zone_name in remaining if zone_name in failed_zone_names]
+        if not remaining:
+            break
+
+        best_zone = None
+        for zone_name in remaining:
+            selected = _select_zone_candidate(working, zone_name, current_risk, failed_zone_names)
+            if selected is None:
+                continue
+            if best_zone is None:
+                best_zone = (zone_name, selected)
+                continue
+            _, current_best = best_zone
+            if (
+                selected["sufficient"] and not current_best["sufficient"]
+                or selected["after_value"] < current_best["after_value"]
+            ):
+                best_zone = (zone_name, selected)
+
+        if best_zone is None:
+            break
+
+        zone_name, selected = best_zone
+        step = _step_from_candidate(
+            selected["candidate"],
+            [zone_name],
+            current_risk,
+            selected["after_risk"],
+            failed_zone_names,
+            scope="zone",
+        )
+        steps.append(step)
+        _apply_whole_plan_action(working, _build_whole_plan_action([step], failed_zone_names))
+        current_risk = selected["after_risk"]
+
+    current_frequency = FrequencyEngine.calculate_F(working)
+    original_frequency_failed = _failed_frequency_zone_names(frequency_results or current_frequency)
+    for _ in range(MAX_PLAN_STEPS):
+        remaining_frequency = _failed_frequency_zone_names(current_frequency)
+        if original_frequency_failed:
+            remaining_frequency = [
+                zone_name for zone_name in remaining_frequency
+                if zone_name in original_frequency_failed
+            ]
+        if not remaining_frequency:
+            break
+
+        best_frequency = None
+        for zone_name in remaining_frequency:
+            selected = _select_frequency_candidate(
+                working,
+                zone_name,
+                current_risk,
+                current_frequency,
+                remaining_frequency,
+            )
+            if selected is None:
+                continue
+            if best_frequency is None:
+                best_frequency = (zone_name, selected)
+                continue
+            _, current_best = best_frequency
+            if (
+                selected["sufficient"] and not current_best["sufficient"]
+                or selected["after_value"] < current_best["after_value"]
+            ):
+                best_frequency = (zone_name, selected)
+
+        if best_frequency is None:
+            break
+
+        zone_name, selected = best_frequency
+        candidate = selected["candidate"]
+        old_f = current_frequency.get(zone_name, {}).get("F_total")
+        new_f = selected["after_frequency"].get(zone_name, {}).get("F_total")
+        step = _step_from_candidate(
+            candidate,
+            [zone_name],
+            current_risk,
+            selected["after_risk"],
+            failed_zone_names,
+            scope="zone",
+        )
+        step["old_f"] = old_f
+        step["new_f"] = new_f
+        step["frequency_sufficient"] = selected["sufficient"]
+        step["protection_factor"] = "PSPD"
+        step["protection_factor_label"] = PROTECTION_FACTORS["PSPD"]["label"]
+        step["selected_because"] = (
+            "Selected after the risk package because frequency still exceeded FT. "
+            "The candidate was simulated on the updated building state."
+        )
+        steps.append(step)
+        _apply_whole_plan_action(working, _build_whole_plan_action([step], failed_zone_names))
+        current_risk = selected["after_risk"]
+        current_frequency = selected["after_frequency"]
+
+    grouped_steps = _group_plan_steps(steps, failed_zone_names)
+    return {
+        "steps": grouped_steps,
+        "trace": [
+            {
+                "display": item.get("display"),
+                "scope": item.get("scope"),
+                "old_r": item.get("old_r"),
+                "new_r": item.get("new_r"),
+                "risk_reduction": item.get("risk_reduction"),
+                "fixed_count": item.get("fixed_count"),
+                "all_pass": item.get("all_pass"),
+                "selected": item.get("selected", False),
+                "reason": item.get("reason"),
+            }
+            for item in evaluation_trace
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1248,6 +2058,134 @@ class ProtectionRecommendationEngine:
                 zone_name, values, zone, building
             )
         return output
+
+    @staticmethod
+    def generate_plan(
+        building,
+        risk_results,
+        protection_recommendations=None,
+        frequency_results=None,
+        frequency_recommendations=None,
+    ):
+        """Create an Annex-F-style protection planning summary.
+
+        This is intentionally separate from the per-zone action cards. Annex F
+        first identifies failed zones and dominant R components, then selects
+        protection measures whose scope may be zone-level, line-level,
+        building-level, or multi-zone.
+        """
+        failed_zones = []
+        failed_frequency_zones = []
+        all_factors = []
+        failed_zone_names = []
+
+        for zone_name, values in risk_results.items():
+            if zone_name == "Building_Total":
+                continue
+
+            r_total = values.get("R_total", 0) or 0
+            rt = values.get("RT", 1e-5) or 1e-5
+            if r_total <= rt:
+                continue
+
+            dominant = _dominant_zone_components(values)
+            factors = _unique_in_order(
+                factor
+                for component in dominant
+                for factor in component.get("control_factors", [])
+            )
+            all_factors += factors
+            failed_zone_names.append(zone_name)
+            failed_zones.append({
+                "zone_name": zone_name,
+                "r_total": r_total,
+                "rt": rt,
+                "ratio": r_total / rt if rt else None,
+                "dominant_components": dominant,
+                "control_factors": [
+                    {"factor": factor, "label": _factor_label(factor)}
+                    for factor in factors
+                ],
+            })
+
+        for zone_name, values in (frequency_results or {}).items():
+            if zone_name == "Building_Total":
+                continue
+            f_total = values.get("F_total", 0) or 0
+            ft = values.get("FT", 5e-2) or 5e-2
+            if f_total <= ft:
+                continue
+            grouped_frequency = _grouped_frequency(values)
+            failed_frequency_zones.append({
+                "zone_name": zone_name,
+                "f_total": f_total,
+                "ft": ft,
+                "ratio": f_total / ft if ft else None,
+                "dominant_components": _top_contributors(
+                    grouped_frequency,
+                    f_total,
+                    min_percent=5,
+                    top_n=4,
+                ),
+                "control_factors": [
+                    {"factor": "PSPD", "label": _factor_label("PSPD")}
+                ],
+            })
+            all_factors.append("PSPD")
+
+        if not failed_zones and not failed_frequency_zones:
+            return {
+                "status": "not_required",
+                "summary": "All zones are within the tolerable risk and frequency limits.",
+                "failed_zones": [],
+                "failed_frequency_zones": [],
+                "dominant_control_factors": [],
+                "recommended_steps": [],
+                "evaluation_trace": [],
+                "apply_action": None,
+            }
+
+        package_plan = _build_package_level_plan(
+            building,
+            risk_results,
+            failed_zones,
+            frequency_results,
+        )
+        recommended_steps = package_plan.get("steps", [])
+        evaluation_trace = package_plan.get("trace", [])
+        if not recommended_steps:
+            raw_steps = []
+            for zone_name in failed_zone_names:
+                raw_steps += _extract_plan_steps(
+                    zone_name,
+                    (protection_recommendations or {}).get(zone_name, []),
+                )
+            recommended_steps = _group_plan_steps(raw_steps, failed_zone_names)
+        apply_action = _build_whole_plan_action(recommended_steps, failed_zone_names)
+        factor_names = _unique_in_order(all_factors)
+
+        return {
+            "status": "protection_required",
+            "summary": (
+                "Protection is required in the listed zones. Dominant calculated "
+                "risk components are identified first. Broad building/line packages "
+                "are simulated before zone-specific measures, then the whole plan is "
+                "applied together and recalculated once."
+            ),
+            "failed_zones": failed_zones,
+            "failed_frequency_zones": failed_frequency_zones,
+            "dominant_control_factors": [
+                {"factor": factor, "label": _factor_label(factor)}
+                for factor in factor_names
+            ],
+            "recommended_steps": recommended_steps,
+            "evaluation_trace": evaluation_trace,
+            "apply_action": apply_action,
+            "engineering_basis": (
+                "Annex-F-style planning: failed zones -> dominant R components -> "
+                "adjustable protection factors -> protection measures with scope."
+            ),
+        }
 
     @staticmethod
     def get_top_frequency_contributors(values, min_percent=5, top_n=3):

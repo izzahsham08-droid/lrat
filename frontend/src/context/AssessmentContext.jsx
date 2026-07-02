@@ -147,52 +147,102 @@ export function AssessmentProvider({ children }) {
     const BUILDING_LEVEL_FIELDS = ['LPS_class']
     const LINE_LEVEL_FIELDS = ['equipotential_bonding_level']
     const PEB_ORDER = ['none', 'III-IV', 'II', 'I']
+    const LPS_ORDER = [null, 'IV', 'III', 'II', 'I']
+    const SPD_ORDER = ['none', 'III_IV', 'II', 'I', 'better_2_5', 'better_3_75', 'better_5']
 
     const action = (
       typeof actionOrField === 'object' && actionOrField !== null
         ? actionOrField
         : { field: actionOrField, value: maybeValue, overrides: { [actionOrField]: maybeValue } }
     )
+    const isWholePlan = action.type === 'apply_protection_plan'
     const overrides = action.overrides ?? { [action.field]: action.value }
     const overrideFields = Object.keys(overrides)
-    const scope = overrideFields.some(field => BUILDING_LEVEL_FIELDS.includes(field))
-      ? 'building'
-      : overrideFields.some(field => LINE_LEVEL_FIELDS.includes(field))
-        ? 'line'
-        : 'zone'
+    const scope = isWholePlan
+      ? 'whole_plan'
+      : overrideFields.some(field => BUILDING_LEVEL_FIELDS.includes(field))
+        ? 'building'
+        : overrideFields.some(field => LINE_LEVEL_FIELDS.includes(field))
+          ? 'line'
+          : 'zone'
 
     let updatedBuilding = buildingData
     let updatedZones = zonesData
     let updatedLines = linesData
 
     const zoneIndex = zonesData.findIndex(z => z.name === zoneName)
-    if (zoneIndex === -1) return
+    if (!isWholePlan && zoneIndex === -1) return
     const beforeSnapshot = makeAssessmentSnapshot(buildingData, linesData, zonesData, results)
 
-    const upgradePeb = (current, target) => {
-      const currentIdx = PEB_ORDER.indexOf(current ?? 'none')
-      const targetIdx = PEB_ORDER.indexOf(target ?? 'none')
+    const upgradeByOrder = (order, current, target, emptyValue = 'none') => {
+      const currentIdx = order.findIndex(item => item === (current ?? emptyValue))
+      const targetIdx = order.findIndex(item => item === (target ?? emptyValue))
       if (targetIdx < 0) return current
       if (currentIdx < 0) return target
       return targetIdx > currentIdx ? target : current
     }
 
-    Object.entries(overrides).forEach(([field, value]) => {
-      if (BUILDING_LEVEL_FIELDS.includes(field)) {
-        updatedBuilding = { ...(updatedBuilding ?? {}), [field]: value }
-      } else if (LINE_LEVEL_FIELDS.includes(field)) {
-        updatedLines = updatedLines.map(l => ({
-          ...l,
-          [field]: field === 'equipotential_bonding_level'
-            ? upgradePeb(l[field], value)
-            : value,
-        }))
-      } else {
-        updatedZones = updatedZones.map((z, i) => (
-          i === zoneIndex ? { ...z, [field]: value } : z
-        ))
+    const mergeProtectionValue = (field, current, value) => {
+      if (field === 'equipotential_bonding_level') {
+        return upgradeByOrder(PEB_ORDER, current, value)
+      }
+      if (field === 'LPS_class') {
+        return upgradeByOrder(LPS_ORDER, current, value, null)
+      }
+      if (field === 'power_spd_level' || field === 'telecom_spd_level') {
+        return upgradeByOrder(SPD_ORDER, current, value)
+      }
+      if (Array.isArray(value)) {
+        const currentValues = Array.isArray(current) ? current.filter(v => v !== 'none') : []
+        return [...new Set([...currentValues, ...value.filter(v => v !== 'none')])]
+      }
+      return value
+    }
+
+    const buildingOverrides = { ...(action.building_overrides ?? {}) }
+    const lineOverrides = { ...(action.line_overrides ?? {}) }
+    const zoneOverrides = clone(action.zone_overrides ?? {})
+
+    if (!isWholePlan) {
+      Object.entries(overrides).forEach(([field, value]) => {
+        if (BUILDING_LEVEL_FIELDS.includes(field)) {
+          buildingOverrides[field] = value
+        } else if (LINE_LEVEL_FIELDS.includes(field)) {
+          lineOverrides[field] = value
+        } else {
+          zoneOverrides[zoneName] = { ...(zoneOverrides[zoneName] ?? {}), [field]: value }
+        }
+      })
+    }
+
+    Object.entries(buildingOverrides).forEach(([field, value]) => {
+      updatedBuilding = {
+        ...(updatedBuilding ?? {}),
+        [field]: mergeProtectionValue(field, updatedBuilding?.[field], value),
       }
     })
+
+    if (Object.keys(lineOverrides).length) {
+      updatedLines = updatedLines.map(line => {
+        const nextLine = { ...line }
+        Object.entries(lineOverrides).forEach(([field, value]) => {
+          nextLine[field] = mergeProtectionValue(field, nextLine[field], value)
+        })
+        return nextLine
+      })
+    }
+
+    if (Object.keys(zoneOverrides).length) {
+      updatedZones = updatedZones.map(zone => {
+        const overridesForZone = zoneOverrides[zone.name]
+        if (!overridesForZone) return zone
+        const nextZone = { ...zone }
+        Object.entries(overridesForZone).forEach(([field, value]) => {
+          nextZone[field] = mergeProtectionValue(field, nextZone[field], value)
+        })
+        return nextZone
+      })
+    }
 
     setBuildingData(updatedBuilding)
     setZonesData(updatedZones)

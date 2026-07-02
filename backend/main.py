@@ -32,14 +32,14 @@ class PDFRequest(BaseModel):
     building_data: dict
     lines_data: list
     zones_data: list
-    risk_results: dict
-    frequency_results: dict
-    annex_e_results: dict
-    protection_recommendations: dict
-    frequency_recommendations: dict
+    risk_results: Optional[dict] = None
+    frequency_results: Optional[dict] = None
+    annex_e_results: Optional[dict] = None
+    protection_recommendations: Optional[dict] = None
+    frequency_recommendations: Optional[dict] = None
+    protection_plan: Optional[dict] = None
     baseline_assessment: Optional[dict] = None
     applied_protection_history: Optional[list] = None
-    report_mode: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,13 @@ def calculate(req: AssessmentRequest):
         protection_recommendations = ProtectionRecommendationEngine.generate(building, risk_results)
         frequency_results = FrequencyEngine.calculate_F(building)
         frequency_recommendations = ProtectionRecommendationEngine.generate_frequency(building, frequency_results)
+        protection_plan = ProtectionRecommendationEngine.generate_plan(
+            building,
+            risk_results,
+            protection_recommendations,
+            frequency_results,
+            frequency_recommendations,
+        )
         annex_e_results = AnnexERiskEngine.calculate_RE(building)
 
         # ---- SPD consolidation across risk and frequency ----
@@ -119,6 +126,7 @@ def calculate(req: AssessmentRequest):
 
         return {
             "risk_results": risk_results,
+            "protection_plan": protection_plan,
             "protection_recommendations": protection_recommendations,
             "frequency_results": frequency_results,
             "frequency_recommendations": frequency_recommendations,
@@ -132,20 +140,72 @@ def calculate(req: AssessmentRequest):
 def generate_pdf(req: PDFRequest):
     try:
         from pdf_generator import generate_pdf_report
+
+        current_building = build_building_from_session(req.building_data, req.lines_data, req.zones_data)
+        current_risk = req.risk_results or RiskEngine.calculate_R(current_building)
+        current_frequency = req.frequency_results or FrequencyEngine.calculate_F(current_building)
+        current_annex_e = req.annex_e_results or AnnexERiskEngine.calculate_RE(current_building)
+
+        baseline = req.baseline_assessment or {}
+        baseline_results = baseline.get("results") or {}
+        baseline_building_data = baseline.get("building_data") or req.building_data
+        baseline_lines_data = baseline.get("lines_data") or req.lines_data
+        baseline_zones_data = baseline.get("zones_data") or req.zones_data
+
+        # "Before" is the saved unprotected/baseline assessment from the UI.
+        # If the user has not applied protection yet, this is the current result.
+        baseline_building = build_building_from_session(
+            baseline_building_data,
+            baseline_lines_data,
+            baseline_zones_data,
+        )
+        risk_before = baseline_results.get("risk_results") or current_risk or RiskEngine.calculate_R(baseline_building)
+        frequency_before = baseline_results.get("frequency_results") or current_frequency or FrequencyEngine.calculate_F(baseline_building)
+        annex_e_before = baseline_results.get("annex_e_results") or current_annex_e or AnnexERiskEngine.calculate_RE(baseline_building)
+
+        protection_recommendations = (
+            baseline_results.get("protection_recommendations")
+            or req.protection_recommendations
+            or ProtectionRecommendationEngine.generate(baseline_building, risk_before)
+        )
+        frequency_recommendations = (
+            baseline_results.get("frequency_recommendations")
+            or req.frequency_recommendations
+            or ProtectionRecommendationEngine.generate_frequency(baseline_building, frequency_before)
+        )
+        protection_plan = (
+            baseline_results.get("protection_plan")
+            or req.protection_plan
+            or ProtectionRecommendationEngine.generate_plan(
+                baseline_building, risk_before, protection_recommendations,
+                frequency_before, frequency_recommendations,
+            )
+        )
+
+        protection_applied = bool(req.applied_protection_history)
+        if protection_applied:
+            risk_after = current_risk
+            frequency_after = current_frequency
+            annex_e_after = current_annex_e
+        else:
+            risk_after = risk_before
+            frequency_after = frequency_before
+            annex_e_after = annex_e_before
+
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         tmp.close()
         generate_pdf_report(
             tmp.name,
             req.building_data, req.lines_data, req.zones_data,
-            req.risk_results, req.frequency_results, req.annex_e_results,
-            req.protection_recommendations, req.frequency_recommendations,
-            baseline_assessment=req.baseline_assessment,
-            applied_protection_history=req.applied_protection_history or [],
-            report_mode=req.report_mode or "current"
+            risk_before, frequency_before, annex_e_before,
+            risk_after, frequency_after, annex_e_after,
+            protection_recommendations, frequency_recommendations,
+            protection_plan,
+            req.applied_protection_history or [],
         )
         return FileResponse(tmp.name, media_type="application/pdf", filename="lightning_risk_report.pdf")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
 
 
 # ---------------------------------------------------------------------------
